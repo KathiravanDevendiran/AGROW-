@@ -35,7 +35,25 @@ async function readDb() {
             purchases: parsed.purchases || []
         } as { users: User[], scans: Scan[], products: Product[], purchases: Purchase[] };
     } catch (error) {
-        return { users: [], scans: [], products: [], purchases: [] };
+        // Initialize with default admin if data not found
+        const defaultAdmin: User = {
+            id: 'admin-001',
+            name: 'System Admin',
+            phone: 'admin',
+            passwordHash: 'mock_hash',
+            role: 'admin',
+            farmDetails: {
+                location: 'HQ',
+                crop: 'All',
+                area: 'HQ'
+            }
+        };
+        return { 
+            users: [defaultAdmin], 
+            scans: [], 
+            products: [], 
+            purchases: [] 
+        };
     }
 }
 
@@ -59,37 +77,63 @@ app.get('/health', (req, res) => {
     res.send('AGROW Lens API is running with Universal AI Engine');
 });
 
-// Auth Login
+// Auth Login (JSON Persistence)
 app.post('/api/auth/login', async (req, res) => {
     const { phone, name, farmDetails } = req.body;
-    const db = await readDb();
-    let user = db.users.find(u => u.phone === phone);
-    if (!user) {
-        user = {
-            id: uuidv4(),
-            name: name || 'Explorer',
-            phone,
-            passwordHash: 'mock_hash',
-            role: 'farmer',
-            farmDetails: farmDetails || { location: 'Unknown', crop: 'General', area: 'Smallholder' }
-        };
-        db.users.push(user);
-        await writeDb(db);
+    
+    try {
+        const db = await readDb();
+        let user = db.users.find(u => u.phone === phone);
+        
+        if (!user) {
+            user = {
+                id: uuidv4(),
+                name: name || 'Explorer',
+                phone: phone,
+                passwordHash: 'mock_hash',
+                role: 'farmer',
+                farmDetails: {
+                    location: farmDetails?.location || 'Unknown',
+                    crop: farmDetails?.crop || 'General',
+                    area: farmDetails?.area || 'Smallholder'
+                }
+            };
+            db.users.push(user);
+            await writeDb(db);
+        }
+
+        res.json({
+            token: `mock-jwt-token-${user.id}`,
+            user: { 
+                id: user.id, 
+                name: user.name, 
+                phone: user.phone, 
+                farmDetails: user.farmDetails
+            }
+        });
+    } catch (err) {
+        console.error("Login Error:", err);
+        res.status(500).json({ error: "Authentication failed" });
     }
-    res.json({
-        token: `mock-jwt-token-${user.id}`,
-        user: { id: user.id, name: user.name, phone: user.phone, farmDetails: user.farmDetails }
-    });
 });
 
-// Get Scans
+// Get Scans (JSON Persistence)
 app.get('/api/scans', async (req, res) => {
     const authHeader = req.headers.authorization;
     if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
     const userId = authHeader.replace('Bearer mock-jwt-token-', '');
-    const db = await readDb();
-    const userScans = db.scans.filter(s => s.userId === userId);
-    res.json(userScans.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()));
+    
+    try {
+        const db = await readDb();
+        const userScans = db.scans
+            .filter(s => s.userId === userId)
+            .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+        
+        res.json(userScans);
+    } catch (err) {
+        console.error("Fetch Scans Error:", err);
+        res.status(500).json({ error: "Failed to fetch scan history" });
+    }
 });
 
 // Create Scan (UNIVERSAL AI ENGINE)
@@ -109,7 +153,7 @@ app.post('/api/scans', async (req, res) => {
         const base64Data = imageUrl.split(',')[1];
         const mimeType = imageUrl.split(',')[0].split(':')[1].split(';')[0];
 
-        const prompt = `You are the AGROW Lens AI. Analyze this leaf image. 
+        const prompt = `You are the AGROW Lens AI, an advanced agricultural intelligence engine. Analyze this leaf image. 
         The farmer's primary interest is ${userTargetCrop}.
         Identify:
         1. Exact Plant Species.
@@ -117,6 +161,8 @@ app.post('/api/scans', async (req, res) => {
         3. If diseased, identify the exact disease.
         4. Detailed remediation (Organic and Chemical).
         5. Common Name of the plant.
+        6. Yield Impact Forecast: Estimate the potential percentage loss in crop yield if this condition is left untreated, based on the severity seen. Prefix with "Warning:" or "Optimal:".
+        7. Treatment Forecast: Predict how quickly the plant will recover if the suggested treatments are applied immediately.
         
         Return ONLY a JSON object:
         {
@@ -129,6 +175,8 @@ app.post('/api/scans', async (req, res) => {
           "symptoms": ["list", "of", "symptoms"],
           "treatmentOrganic": "detailed organic solution",
           "treatmentChemical": "detailed chemical solution",
+          "yieldImpact": "Estimated yield loss % and contextual warning",
+          "treatmentForecast": "Estimated recovery timeline",
           "confidence": 0.0-1.0
         }`;
 
@@ -188,33 +236,135 @@ app.post('/api/scans', async (req, res) => {
         } else {
             analysisLogs.push({ step: 'Dynamic Remediation synthesized via Neural Logic.', timestamp: new Date().toISOString(), status: 'info' });
         }
+        
+        analysisLogs.push({ step: 'Diagnostic Pack Generated.', timestamp: new Date().toISOString(), status: 'success' });
 
-        const scanResult: Scan = {
-            id: uuidv4(),
+        const scanId = uuidv4();
+        const finalStatus = (localMatch?.status || aiResult.status) as 'Healthy' | 'Action Needed' | 'Critical';
+        const finalAdvice = localMatch?.advice || aiResult.advice;
+        const finalSymptoms = localMatch?.symptoms || aiResult.symptoms || [];
+        const finalOrganic = localMatch?.treatment.organic || aiResult.treatmentOrganic;
+        const finalChemical = localMatch?.treatment.chemical || aiResult.treatmentChemical;
+        const finalYieldImpact = aiResult.yieldImpact || "Data insufficient to calculate immediate yield impact.";
+        const finalTreatmentForecast = aiResult.treatmentForecast || "Recovery timeline unknown based on current telemetry.";
+        const finalConfidence = aiResult.confidence;
+        const finalCommonName = aiResult.commonName;
+        const finalScientificName = localMatch?.scientificName || aiResult.scientificName;
+
+        const db = await readDb();
+        const newScan: Scan = {
+            id: scanId,
             userId,
             imageUrl,
             crop: aiResult.identifiedCrop,
             predictedDisease: aiResult.condition,
-            scientificName: localMatch?.scientificName || aiResult.scientificName,
-            commonName: aiResult.commonName,
-            confidence: aiResult.confidence,
-            status: localMatch?.status || aiResult.status,
+            scientificName: finalScientificName,
+            commonName: finalCommonName,
+            status: finalStatus,
+            advice: finalAdvice,
+            symptoms: finalSymptoms,
+            treatmentOrganic: finalOrganic,
+            treatmentChemical: finalChemical,
+            confidence: finalConfidence,
             createdAt: new Date().toISOString(),
-            advice: localMatch?.advice || aiResult.advice,
-            symptoms: localMatch?.symptoms || aiResult.symptoms,
-            treatmentOrganic: localMatch?.treatment.organic || aiResult.treatmentOrganic,
-            treatmentChemical: localMatch?.treatment.chemical || aiResult.treatmentChemical,
-            analysisLogs: [...analysisLogs, { step: 'Diagnostic Pack Generated.', timestamp: new Date().toISOString(), status: 'success' }]
+            analysisLogs: analysisLogs
         };
 
-        const db = await readDb();
-        db.scans.push(scanResult);
+        db.scans.push(newScan);
         await writeDb(db);
-        return res.json(scanResult);
+        
+        return res.json(newScan);
 
     } catch (error) {
         console.error("Critical Engine Error:", error);
         return res.status(500).json({ error: "AI Synthesis Error: Connection Interrupted." });
+    }
+});
+
+// Save Local Python Scan to JSON Database
+app.post('/api/scans/save-local', async (req, res) => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) return res.status(401).json({ error: 'Unauthorized' });
+    const userId = authHeader.replace('Bearer mock-jwt-token-', '');
+    
+    const { crop, predictedDisease, scientificName, commonName, confidence, advice, symptoms, treatmentOrganic, treatmentChemical } = req.body;
+
+    try {
+        const db = await readDb();
+        const scanId = uuidv4();
+        
+        const newScan: Scan = {
+            id: scanId,
+            userId,
+            imageUrl: '', // Local scans might not have an immediate URL
+            crop,
+            predictedDisease,
+            scientificName,
+            commonName,
+            status: predictedDisease && predictedDisease !== 'Healthy' ? 'Action Needed' : 'Healthy',
+            advice,
+            symptoms: symptoms || [],
+            treatmentOrganic,
+            treatmentChemical,
+            confidence,
+            createdAt: new Date().toISOString(),
+            analysisLogs: [
+                { step: 'Local AI Vision Engine Processed', timestamp: new Date().toISOString(), status: 'success' }
+            ]
+        };
+
+        db.scans.push(newScan);
+        await writeDb(db);
+        
+        res.json({ success: true, scanId });
+    } catch (err) {
+        console.error("Save Local Scan Error:", err);
+        res.status(500).json({ error: "Failed to save local scan to history" });
+    }
+});
+
+// Admin Route: Get comprehensive system data
+app.get('/api/admin/system-data', async (req, res) => {
+    try {
+        const db = await readDb();
+        
+        const usersWithStats = db.users.map(u => {
+            const userScans = db.scans.filter(s => s.userId === u.id);
+            return {
+                id: u.id,
+                name: u.name,
+                phone: u.phone,
+                role: u.role,
+                farmLocation: u.farmDetails?.location,
+                farmCrop: u.farmDetails?.crop,
+                createdAt: (u as any).createdAt || new Date().toISOString(),
+                scanCount: userScans.length,
+                lastScanDate: userScans.length > 0 
+                  ? userScans.reduce((max, s) => s.createdAt > max.createdAt ? s : max).createdAt 
+                  : null
+            };
+        });
+
+        const recentScans = db.scans
+            .map(s => {
+                const user = db.users.find(u => u.id === s.userId);
+                return {
+                    id: s.id,
+                    crop: s.crop,
+                    predictedDisease: s.predictedDisease,
+                    confidence: s.confidence,
+                    createdAt: s.createdAt,
+                    userName: user?.name || 'Unknown',
+                    userPhone: user?.phone || 'Unknown'
+                };
+            })
+            .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+            .slice(0, 50);
+
+        res.json({ users: usersWithStats, recentScans });
+    } catch (err) {
+        console.error("Admin Error:", err);
+        res.status(500).json({ error: "Failed to fetch admin system data" });
     }
 });
 
